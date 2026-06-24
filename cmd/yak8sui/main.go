@@ -12,7 +12,7 @@ import (
 // main is the entry point: execution starts here when the binary runs.
 func main() {
 	// The namespace we want to inspect. Hardcoded for now.
-	namespace := "default"
+	namespace := "kube-system"
 
 	// Tell the user what we're about to do.
 	fmt.Printf("Fetching pods from namespace: [%s]...\n\n", namespace)
