@@ -100,6 +100,6 @@ func main() {
 
 	// 5. Run
 	if err := app.SetRoot(grid, true).EnableMouse(true).Run(); err != nil {
-		log.Fatalf("Ошибка запуска интерфейса: %v", err)
+		log.Fatalf("Error of interface: %v", err)
 	}
 }
