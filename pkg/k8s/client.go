@@ -1,5 +1,4 @@
 // package k8s holds all logic for talking to the Kubernetes API.
-// Keeping it separate from main lets us reuse and test it independently.
 package k8s
 
 import (
@@ -17,22 +16,19 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 )
 
+// PodInfo holds the name and status of a pod.
 type PodInfo struct {
 	Name   string
 	Status string
 }
 
-// GetPodNames connects to the cluster and returns the names of the pods
-// in the given namespace. It returns an error instead of crashing, so the
-// caller decides how to handle failures.
 func GetPodNames(namespace string) ([]PodInfo, error) {
 	// Ask the OS for the current user's home directory (e.g. /Users/you).
 	home, err := os.UserHomeDir()
 	if err != nil {
-		// %w wraps the original error so the caller can inspect it later.
 		return nil, fmt.Errorf("failed to get home dir: %w", err)
 	}
-	// Build the standard kubeconfig path: ~/.kube/config
+
 	kubeconfig := filepath.Join(home, ".kube", "config")
 
 	// Read the kubeconfig file and turn it into a connection config.
@@ -56,16 +52,12 @@ func GetPodNames(namespace string) ([]PodInfo, error) {
 		return nil, fmt.Errorf("failed to list pods: %w", err)
 	}
 
-	// Pre-allocate a slice with length 0 but capacity for every pod,
-	// which avoids re-allocating as we append.
 	names := make([]PodInfo, 0, len(pods.Items))
 
-	// Loop over each pod; "_" discards the index since we only need the value.
 	for _, pod := range pods.Items {
 		// Collect just the pod's name into our result slice.
 		names = append(names, PodInfo{Name: pod.Name, Status: string(pod.Status.Phase)})
 	}
 
-	// Return the names and a nil error to signal success.
 	return names, nil
 }
