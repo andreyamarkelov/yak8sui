@@ -19,12 +19,12 @@ func main() {
 
 	// 2. Create the table for displaying pods
 	table := tview.NewTable().
-		SetBorders(true).
+		SetBorders(false).
 		SetSelectable(true, false)
 
 	table.SetBorder(true).
 		SetTitle(fmt.Sprintf(" Pods in namespace: [%s] ", namespace)).
-		SetTitleAlign(tview.AlignLeft)
+		SetTitleAlign(tview.AlignCenter)
 
 	// Шапка таблицы
 	table.SetCell(0, 0, tview.NewTableCell("#").SetTextColor(tcell.ColorYellow).SetSelectable(false))
@@ -86,17 +86,39 @@ func main() {
 		return event
 	})
 
-	// Help
-	footer := tview.NewTextView().
-		SetText(" [Arrows] Navigation | [[yellow]r[-]] refresh | [[red]Esc[-] / [red]Ctrl+C[-]] exit").
-		SetDynamicColors(true)
+	headerArt := `    __   __ _    _  _____ ____  _   _ ___ 
+	\ \ / // \  | |/ ( _ ) ___|| | | |_ _|
+	 \ V // _ \ | ' // _ \___ \| | | || | 
+	  | |/ ___ \| . \ (_) |__) | |_| || | 
+	  |_/_/   \_\_|\_\___/____/ \___/|___|
+	    Yust another k8s User Interface`
 
-	// Grid to neatly arrange the table and footer
-	grid := tview.NewGrid().
-		SetRows(0, 1). // Table takes up the entire screen, footer is 1 row high
-		SetColumns(0).
-		AddItem(table, 0, 0, 1, 1, 0, 0, true).
-		AddItem(footer, 1, 0, 1, 1, 0, 0, false)
+headerLeft := tview.NewTextView().
+    SetText(headerArt).
+    SetTextColor(tcell.ColorLightGreen).
+    SetWrap(false).          
+    SetWordWrap(false).     
+    SetTextAlign(tview.AlignLeft)
+
+
+headerRight := tview.NewTextView().
+    SetText("\n\n CONTEXT:   prod-cluster-europe\n NAMESPACE: kube-system\n STATUS:    [green]Connected[-]").
+    SetDynamicColors(true).
+    SetTextAlign(tview.AlignLeft)
+
+	footer := tview.NewTextView().
+    SetText(" [[yellow]?[-]] help | [[yellow]r[-]] refresh | [[red]Esc[-] / [red]Ctrl+C[-]] exit").
+    SetDynamicColors(true)
+
+// Настраиваем сетку
+grid := tview.NewGrid().
+    SetRows(7, 0, 1).     
+    SetColumns(60, 0).   
+
+    AddItem(headerLeft,  0, 0, 1, 1, 0, 0, false).
+    AddItem(headerRight, 0, 1, 1, 1, 0, 0, false).
+    AddItem(table,       1, 0, 1, 2, 0, 0, true).  
+    AddItem(footer,      2, 0, 1, 2, 0, 0, false)
 
 	// 5. Run
 	if err := app.SetRoot(grid, true).EnableMouse(true).Run(); err != nil {
