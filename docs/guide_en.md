@@ -16,9 +16,10 @@ you switch namespaces on the fly, similar to the popular tool `k9s`.
 2. [The data layer: talking to Kubernetes (`client-go`)](#2-the-data-layer-talking-to-kubernetes-client-go)
 3. [The UI layer: drawing with `tview`](#3-the-ui-layer-drawing-with-tview)
 4. [The refactor: `App` as the single source of truth](#4-the-refactor-app-as-the-single-source-of-truth)
-5. [Putting it together: how a namespace switch flows](#5-putting-it-together-how-a-namespace-switch-flows)
-6. [Common pitfalls](#6-common-pitfalls)
-7. [Resources](#7-resources)
+5. [Go mechanics, up close](#5-go-mechanics-up-close)
+6. [Putting it together: how a namespace switch flows](#6-putting-it-together-how-a-namespace-switch-flows)
+7. [Common pitfalls](#7-common-pitfalls)
+8. [Resources](#8-resources)
 
 ---
 
@@ -58,6 +59,34 @@ The directory name becomes the binary name. `cmd/yak8sui/` produces a binary
 called `yak8sui`. The `cmd/` folder is a *container* for one-or-more programs.
 The one hard rule Go enforces: **one `main` package per directory.** Reserving
 `cmd/yak8sui/` now means you can add a second binary later without restructuring.
+
+### The project file map
+
+Here is every file and what it's responsible for. Keep this handy — the rest of
+the guide refers to these files by name:
+
+```
+yak8sui/
+├── cmd/
+│   └── yak8sui/
+│       └── main.go         # entry point: builds App and calls Run()
+├── pkg/
+│   ├── k8s/                # DATA layer (package k8s) — knows client-go
+│   │   ├── client.go       #   newClientset(): kubeconfig → clientset
+│   │   ├── pods.go         #   PodInfo struct + ListPods(namespace)
+│   │   └── namespaces.go   #   ListNamespaces()
+│   └── ui/                 # UI layer (package ui) — knows tview
+│       ├── app.go          #   App struct, New(), Run(), SetNamespace(),
+│       │                   #   the global keybinding, showNamespacePicker(), modal()
+│       ├── pods.go         #   newPodsTable(): the pods table + refreshData()
+│       └── colors.go       #   statusColor(): maps a pod status to a color
+├── go.mod                  # module name + dependency versions
+└── go.sum                  # cryptographic checksums of those dependencies
+```
+
+A quick way to read it: **one folder per package**, **one file per responsibility**.
+To add a "deployments" feature later you'd create `pkg/k8s/deployments.go` (data)
+and `pkg/ui/deployments.go` (view) — no existing files need to change.
 
 ---
 
@@ -150,12 +179,46 @@ are legal:
 > Go would refuse `pod.Name` with an `ambiguous selector` error and you'd have to
 > write the full path.
 
-### 2.6 A shared client constructor
+### 2.6 A shared client constructor — and the Go error pattern
 
-Both `ListPods` and `ListNamespaces` need a `clientset`, so the setup
-(find `~/.kube/config` → build config → create clientset) lives in one private
-helper, `newClientset()`, inside `client.go`. This avoids repeating the same code
-in every data function.
+Both `ListPods` and `ListNamespaces` need a `clientset`, so the setup lives in one
+private helper, `newClientset()`, inside `client.go`:
+
+```go
+func newClientset() (*kubernetes.Clientset, error) {
+    home, err := os.UserHomeDir()
+    if err != nil {
+        return nil, fmt.Errorf("failed to get home dir: %w", err)
+    }
+
+    kubeconfig := filepath.Join(home, ".kube", "config")
+
+    config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+    if err != nil {
+        return nil, fmt.Errorf("failed to build kubeconfig: %w", err)
+    }
+
+    clientset, err := kubernetes.NewForConfig(config)
+    if err != nil {
+        return nil, fmt.Errorf("failed to create kubernetes client: %w", err)
+    }
+
+    return clientset, nil
+}
+```
+
+Centralizing this means `ListPods` and `ListNamespaces` don't each repeat the
+setup. It also shows the **Go error-handling idiom** you'll see everywhere:
+
+- Go has no exceptions. A function that can fail returns an `error` as its **last
+  return value**; `nil` means "success, no error."
+- After each fallible call you check `if err != nil` and **return early**. That's
+  why Go reads as a flat "do a step, check the error" sequence instead of nested
+  try/catch blocks.
+- `fmt.Errorf("...: %w", err)` **wraps** the original error with a human-readable
+  message. The `%w` verb keeps the underlying error attached, so a caller can both
+  read your message *and* inspect the original cause.
+- On success the final line returns the real value plus `nil`.
 
 ---
 
@@ -190,8 +253,8 @@ called `refreshData()`. Each call:
 1. Updates the table title to the current namespace.
 2. Clears old rows (keeping the header) with `table.RemoveRow()`.
 3. Fetches a fresh slice of pods from `pkg/k8s`.
-4. Re-creates cells, applying **color coding by status** via `tcell` (Running →
-   green, Pending → yellow, else red).
+4. Re-creates cells, applying **color coding by status** via the `statusColor`
+   helper in `colors.go` (Running/Succeeded → green, Pending → yellow, else red).
 
 ### 3.4 Handling keyboard input
 
@@ -208,8 +271,9 @@ This is the most important architectural idea in the project, so we'll go slow.
 
 ### 4.1 The problem
 
-Originally, each view received the namespace **as a string copied into its
-closure**:
+Before this refactor, each view received the namespace **as a string copied into
+its closure** (this is the *old* signature — you won't find it in the code now,
+we're explaining what we moved away from):
 
 ```go
 func newPodsTable(app *tview.Application, namespace string) *tview.Table {
@@ -262,6 +326,36 @@ func (a *App) SetNamespace(ns string) {
         refresh()
     }
 }
+```
+
+Picture it as a hub-and-spoke. At startup every view **subscribes**; later one
+`SetNamespace` call **broadcasts** to all of them:
+
+```
+   REGISTRATION  (each view calls a.register(refreshData) at startup)
+
+   ┌────────────┐  ┌──────────────┐  ┌────────────┐
+   │ pods table │  │ deployments  │  │  services  │
+   │refreshData │  │ refreshData  │  │ refreshData│
+   └─────┬──────┘  └──────┬───────┘  └─────┬──────┘
+         │                │                │
+         └────────────────┼────────────────┘
+                          ▼
+              ┌──────────────────────┐
+              │         App          │
+              │  namespace           │
+              │  refreshers []func() │
+              └──────────┬───────────┘
+
+   BROADCAST  (one SetNamespace reaches every view at once)
+
+                          │  SetNamespace("kube-system")
+                          │  → range a.refreshers
+                          ▼
+           ╔═══════════════════════════════════╗
+           ║ every refresh() fires at once —  ║
+           ║ all views redraw themselves      ║
+           ╚═══════════════════════════════════╝
 ```
 
 ### 4.3 How a view plugs in
@@ -331,7 +425,248 @@ func newDeploymentsTable(a *App) *tview.Table {
 
 ---
 
-## 5. Putting it together: how a namespace switch flows
+## 5. Go mechanics, up close
+
+This section zooms in on the Go language features that make the architecture
+above possible. If you're new to Go, these are the "aha" concepts.
+
+> **New to pointers?** A few symbols show up all over this code:
+> - `*App` means "a pointer to an `App`" — an arrow pointing at the real struct in
+>   memory, not a copy of it.
+> - `&App{...}` means "create an `App` and give me its address" (a pointer to it).
+> - `a.namespace` reads a field *through* the pointer — Go follows the arrow for you,
+>   so you don't need special syntax.
+>
+> Why bother instead of just copying the struct? Two reasons: (1) copying a big
+> struct on every call is wasteful, and (2) more importantly, if each view had its
+> own *copy* of `App`, changing `namespace` in one wouldn't affect the others. The
+> entire design depends on **one shared `App`** — pointers guarantee everyone is
+> looking at the same box in memory.
+
+### 5.1 Methods and receivers: how behavior attaches to data
+
+In OOP languages (Java, C#, Python) methods are written *inside* the class body.
+Go separates data and behavior physically, then links them with a **receiver**.
+
+A struct holds only data:
+
+```go
+type App struct {
+    app   *tview.Application
+    pages *tview.Pages
+    // ...
+}
+```
+
+A method is a normal function with an extra `(a *App)` before its name:
+
+```go
+func (a *App) Run() error {
+    // ...
+}
+```
+
+That `(a *App)` is the glue. It's a **pointer receiver**, and it tells Go: "this
+`Run` function belongs to `App`, and inside it `a` refers to the specific instance
+it was called on." So when `main.go` does:
+
+```go
+app := ui.New(ui.Config{Namespace: "kube-system"})
+err := app.Run()
+```
+
+Go passes your `app` variable into `Run` as `a`. Inside `Run` you can then write
+`a.app.SetRoot(...)` or `a.showNamespacePicker()`.
+
+> **Why a pointer (`*App`) and not a value (`App`)?** A pointer receiver lets a
+> method *modify* the struct — `SetNamespace` needs to change `a.namespace`, which
+> only works through a pointer. It also avoids copying the whole struct on every
+> call. Rule of thumb: if a struct has more than a handful of fields or any method
+> mutates it, use a pointer receiver.
+>
+> **Why `App` is capitalized but `namespace` is not:** In Go, an identifier that
+> starts with an **uppercase letter is exported** (public — usable from other
+> packages); **lowercase is unexported** (private — visible only inside its own
+> package). So `App`, `Run`, and `Namespace` are public, while `namespace` and
+> `register` are private to `pkg/ui`. That's exactly why views must read the
+> namespace through the `Namespace()` method instead of touching `a.namespace`
+> directly.
+
+A practical benefit: **methods of one struct can live in different files** of the
+same package. Every function that starts with `(a *App)` attaches to the same
+`App` struct, so you can spread them across files instead of bloating one. That's
+why `Run`, `SetNamespace`, and `showNamespacePicker` can all be methods on `App`.
+
+### 5.2 The constructor pattern: `New` + `Config`
+
+Go has no built-in constructors, so by convention we write a `New` function. Watch
+the string `"kube-system"` travel from `main.go` into the running app:
+
+```
+1. In main.go:            "kube-system"
+      ▼
+2. Wrapped in a struct:   ui.Config{Namespace: "kube-system"}
+      ▼
+3. Passed as an argument:  ui.New( ui.Config{...} )
+      ▼
+4. Arrives inside New() as the parameter: cfg
+      ▼
+5. Copied into the struct's private field: a.namespace
+      ▼
+6. Run() can now always read the current namespace
+```
+
+The receiving end:
+
+```go
+func New(cfg Config) *App {
+    return &App{
+        app:       tview.NewApplication(),
+        namespace: cfg.Namespace, // ← the link
+    }
+}
+```
+
+Why wrap arguments in a `Config` struct instead of passing them directly? It makes
+adding future options (context name, refresh interval…) painless without changing
+`New`'s signature. Note the link is **strict**: a typo like `ui.Config{NameSpace: ...}`
+(capital S) or a non-existent field won't compile — Go checks field names exactly.
+
+> **`:=` vs `=`:** The `:=` operator (used in `main.go` as `app := ui.New(...)`)
+> declares a new variable *and* infers its type from the value on the right. Use
+> plain `=` only to reassign a variable that was *already declared*. If you wrote
+> `var app *ui.App` on its own line, the next line would be `app = ui.New(...)`.
+> Also note `&App{...}` — the `&` takes the address of the struct literal, so
+> `New` returns a pointer (`*App`), not a copy.
+
+### 5.3 What's in memory, and the `Run` event loop
+
+After startup, exactly one big box lives in memory — the `app` variable of type
+`*ui.App`:
+
+```
+[ app (*ui.App) in memory ]
+├── namespace   = "kube-system"
+├── app         = [the running tview.Application]
+├── pages       = [page manager, currently holding the Grid]
+├── headerRight = [the text view we write status into]
+└── refreshers  = [list holding the pods table's refreshData()]
+```
+
+When `main.go` reaches `app.Run()`, control passes *into* `tview` and **stops
+there**. The program enters an event loop — think of a guard in an infinite
+`for {}` waiting for signals:
+
+1. **Sleeps and waits** — almost no CPU used, just waiting for terminal events.
+2. **Catches a keypress** — you press `n`.
+3. **Wakes the input capture** — `tview` calls the function we attached in `app.go`.
+4. **Changes the picture** — the handler tells `a.pages` to show the namespace list on top.
+5. **Sleeps again** — until your next key or click.
+
+This is a classic **event-driven application**: static *state* (the `App` struct)
+plus an *engine* (`Run`) that only wakes on input, mutates state, and sleeps again.
+`main.go` simply waits at `app.Run()` until the loop ends (e.g. via `a.app.Stop()`).
+
+### 5.4 Functions as values (and closures)
+
+In Go a function is a value, like a string or a number: you can store it in a
+variable, put it in a slice, or pass it as an argument. That's what powers the
+observer registry.
+
+Think of `App` as a **magazine publisher** with a blank subscriber list
+(`refreshers []func()`). The pods table is a **reader**. When it calls
+`a.register(refreshData)`, it isn't asking for data now — it's handing over its
+"business card" (the function) to be called later:
+
+```go
+type App struct {
+    // ...
+    refreshers []func() // a slice that holds FUNCTIONS
+}
+
+func (a *App) register(refresh func()) {
+    a.refreshers = append(a.refreshers, refresh) // file it away
+}
+```
+
+The type `func()` means "a function taking no arguments and returning nothing."
+Crucially, we pass `refreshData` **without** parentheses — `register(refreshData)`
+hands over the function itself; `register(refreshData())` would *call* it and pass
+the result instead. Later, `SetNamespace` invokes each one **with** parentheses:
+
+```go
+for _, refresh := range a.refreshers {
+    refresh() // the () means "run it now"
+}
+```
+
+The magic is that `refreshData` is a **closure**: it "captured" the `table`
+variable from `newPodsTable`. Even after we hand it to `App`, it still remembers
+which table to clear and fill. And `App` has no idea `pods.go` even exists — it
+just calls abstract functions. Register ten tables (pods, services, deployments)
+and all of them refresh with that one loop.
+
+```
+   newPodsTable(a *App)                          App
+   ┌──────────────────────────────┐             ┌──────────────────┐
+   │ table := tview.NewTable() ◀┐ │             │                  │
+   │                            │ │             │ refreshers       │
+   │ refreshData := func() {    │ │             │   []func()       │
+   │     table.SetTitle(...) ───┘ │  capture    │                  │
+   │     pods := k8s.ListPods(...)│             │                  │
+   │     ...fill rows...          │             │                  │
+   │ }                            │             │                  │
+   │                              │             │                  │
+   └──────────┬───────────────────┘             │                  │
+              │  a.register(refreshData)        │                  │
+              └─────────────────────────────────▶  filed here     │
+                                               └──────────────────┘
+
+   Later, App calls refreshData() from SetNamespace. The closure STILL
+   remembers `table`, so it knows which table to clear and refill —
+   even though App itself never saw `pods.go`.
+```
+
+### 5.5 Walkthrough: the namespace picker and the centering trick
+
+`showNamespacePicker` (in `app.go`) builds the popup:
+
+```go
+list := tview.NewList().ShowSecondaryText(false)         // compact list
+list.SetBorder(true).SetTitle(" Select namespace (Esc to cancel) ")
+
+namespaces, err := k8s.ListNamespaces()                  // ask the cluster
+```
+
+On error it adds a single item showing the message; otherwise it adds one item
+per namespace, each with a callback that fires on Enter:
+
+```go
+for _, ns := range namespaces {
+    ns := ns // capture this iteration's value (see pitfalls)
+    list.AddItem(ns, "", 0, func() {
+        a.SetNamespace(ns)                // triggers the whole refresh chain
+        a.pages.RemovePage("namespace")   // close the popup
+    })
+}
+```
+
+`Esc` removes the page without changing anything. Finally it mounts the list and
+moves keyboard focus to it so the arrow keys drive the list, not the table behind it:
+
+```go
+a.pages.AddPage("namespace", modal(list, 40, 20), true, true)
+a.app.SetFocus(list)
+```
+
+**The centering trick (`modal`):** terminals have no built-in "center this window."
+`modal` nests two flex containers and uses `nil` items as invisible spacers — one
+on each side horizontally, one above and below vertically — pinning a fixed-size
+box (40×20) in the middle no matter how the terminal is resized.
+
+---
+
+## 6. Putting it together: how a namespace switch flows
 
 Here is the full chain of events when the user presses `n` and picks a namespace:
 
@@ -359,7 +694,7 @@ One state change, every subscribed view stays in sync. That's the payoff.
 
 ---
 
-## 6. Common pitfalls
+## 7. Common pitfalls
 
 ### `terminal entry not found: term not set` in the IDE
 Running a TUI from the GoLand/VSCode debug console can crash because that console
@@ -374,22 +709,31 @@ brackets by doubling them — `[[r]]` renders as a literal `[r]`. (That's exactl
 why the footer in `app.go` writes `[[yellow]n[-]]`.)
 
 ### Capturing the loop variable in a closure
-When building list items in a `for` loop, each closure must capture its *own*
-copy of the loop variable:
+When you create a closure inside a `for` loop and the closure uses the loop
+variable, you must make sure each closure captures *this iteration's* value, not
+a single shared variable:
 
 ```go
 for _, ns := range namespaces {
-    ns := ns // capture this iteration's value
+    ns := ns // make a per-iteration copy
     list.AddItem(ns, "", 0, func() { a.SetNamespace(ns) })
 }
 ```
 
-Without the `ns := ns` line (on older Go versions), every item would switch to
-the *last* namespace.
+**The history:** In Go versions before 1.22, `ns` was a *single* variable reused
+every iteration. All the closures would point at that one variable, so by the
+time they ran (on Enter) the loop had finished and `ns` held the *last* value —
+every item would switch to the last namespace. The `ns := ns` line shadowed it
+with a fresh copy per iteration and fixed this.
+
+**Since Go 1.22** (this project uses 1.26), loop variables are per-iteration by
+default, so the `ns := ns` line is technically no longer needed here. We keep it
+because it's harmless, makes the intent obvious to readers who learned on older
+Go, and is a common idiom you'll meet in real codebases.
 
 ---
 
-## 7. Resources
+## 8. Resources
 
 - [pkg.go.dev](https://pkg.go.dev/) — official Go documentation search (including `context`, `os`, `fmt`).
 - [Kubernetes API Reference](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.30/) — field-by-field reference for Pod, Service, Deployment.
