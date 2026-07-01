@@ -13,50 +13,86 @@ type Config struct {
 	Namespace string
 }
 
+// ScreenType defines the type of screen that is currently displayed.
+type ScreenType int
+
+const (
+	ScreenPods ScreenType = iota
+	ScreenDeployments
+)
+
+// String returns a human-readable name for the screen type.
+func (s ScreenType) String() string {
+	switch s {
+	case ScreenPods:
+		return "Pods"
+	case ScreenDeployments:
+		return "Deployments"
+	default:
+		return "Unknown"
+	}
+}
+
+// RefreshRequest represents a request to refresh a specific screen.
+type RefreshRequest struct {
+	Screen    ScreenType
+	Refresher func()
+}
+
 // App is the single source of truth for shared UI state (like the current
 // namespace). Views read that state through it and subscribe to changes so
 // every pane stays in sync.
 type App struct {
 	app         *tview.Application
 	pages       *tview.Pages
+	mainGrid    *tview.Grid
+	headerLeft  *tview.TextView
 	headerRight *tview.TextView
-	namespace   string
-	refreshers  []func()
+
+	podsTable        *tview.Table
+	deploymentsTable *tview.Table
+
+	namespace    string
+	activeScreen ScreenType
+	refreshers   []RefreshRequest
 }
 
 func New(cfg Config) *App {
+	if cfg.Namespace == "" {
+		cfg.Namespace = "default"
+	}
 	return &App{
-		app:       tview.NewApplication(),
-		namespace: cfg.Namespace,
+		app:          tview.NewApplication(),
+		pages:        tview.NewPages(),
+		mainGrid:     tview.NewGrid(),
+		namespace:    cfg.Namespace,
+		activeScreen: ScreenPods, // По умолчанию показываем поды
 	}
 }
 
-func (a *App) Namespace() string { return a.namespace }
+func (a *App) Namespace() string        { return a.namespace }
+func (a *App) ActiveScreen() ScreenType { return a.activeScreen }
 
 // register subscribes a view's redraw function to namespace changes.
-func (a *App) register(refresh func()) {
-	a.refreshers = append(a.refreshers, refresh)
+func (a *App) register(screen ScreenType, refresh func()) {
+	a.refreshers = append(a.refreshers, RefreshRequest{Screen: screen, Refresher: refresh})
 }
 
-// SetNamespace is the only place the namespace is mutated. It updates shared
-// state and then asks every registered view to redraw itself.
 func (a *App) SetNamespace(ns string) {
 	a.namespace = ns
 	a.updateHeader()
-	for _, refresh := range a.refreshers {
-		refresh()
+	a.refreshActiveOnly()
+}
+
+func (a *App) refreshActiveOnly() {
+	for _, req := range a.refreshers {
+		if req.Screen == a.activeScreen {
+			req.Refresher()
+		}
 	}
 }
 
 func (a *App) updateHeader() {
-	if a.headerRight == nil {
-		return
-	}
-	a.headerRight.SetText(fmt.Sprintf("\n\n CONTEXT:   ---\n NAMESPACE: %s\n STATUS:    [green]Connected?[-]", a.namespace))
-}
-
-func (a *App) Run() error {
-	table := newPodsTable(a)
 
 	headerArt := `    __   __ _    _  _____ ____  _   _ ___ 
 	\ \ / // \  | |/ ( _ ) ___|| | | |_ _|
@@ -64,47 +100,96 @@ func (a *App) Run() error {
 	  | |/ ___ \| . \ (_) |__) | |_| || | 
 	  |_/_/   \_\_|\_\___/____/ \___/|___|
 	    Yust another k8s User Interface`
+	a.headerLeft.SetText(headerArt).SetTextColor(tcell.ColorLightCyan)
+	status := fmt.Sprintf("View: [green]%s[white] | Namespace: [yellow]%s[white]", a.ActiveScreen(), a.Namespace())
+	a.headerRight.SetText(status)
 
-	headerLeft := tview.NewTextView().
-		SetText(headerArt).
-		SetTextColor(tcell.ColorLightGreen).
-		SetWrap(false).
-		SetWordWrap(false).
-		SetTextAlign(tview.AlignLeft)
+}
 
-	a.headerRight = tview.NewTextView().
-		SetDynamicColors(true).
-		SetTextAlign(tview.AlignLeft)
+func (a *App) Run() error {
+	a.headerLeft = tview.NewTextView().SetDynamicColors(true)
+	a.headerRight = tview.NewTextView().SetTextAlign(tview.AlignRight).SetDynamicColors(true)
 	a.updateHeader()
 
-	footer := tview.NewTextView().
-		SetText(" [[yellow]n[-]] namespace | [[yellow]r[-]] refresh | [[red]Esc[-] / [red]Ctrl+C[-]] exit").
-		SetDynamicColors(true)
+	headerFlex := tview.NewFlex().
+		AddItem(a.headerLeft, 0, 1, false).
+		AddItem(a.headerRight, 0, 1, false)
 
-	grid := tview.NewGrid().
-		SetRows(7, 0, 1).
-		SetColumns(60, 0).
-		AddItem(headerLeft, 0, 0, 1, 1, 0, 0, false).
-		AddItem(a.headerRight, 0, 1, 1, 1, 0, 0, false).
-		AddItem(table, 1, 0, 1, 2, 0, 0, true).
-		AddItem(footer, 2, 0, 1, 2, 0, 0, false)
+	footerLeft := tview.NewTextView().SetDynamicColors(true)
+	footerRight := tview.NewTextView().SetTextAlign(tview.AlignRight).SetDynamicColors(true)
+	footerLeft.SetText("[[[yellow]n[white]]]amespace | [[[yellow]d[white]]]eployments | [[[yellow]p[white]]]ods")
+	footerRight.SetText("[[[yellow]r[white]]]efresh | [[[yellow]Esc/Ctrl+C[white]]] Quit")
 
-	a.pages = tview.NewPages().AddPage("main", grid, true, true)
+	footerFlex := tview.NewFlex().
+		AddItem(footerLeft, 0, 1, false).
+		AddItem(footerRight, 0, 1, false)
 
-	// Global keybinding: 'n' opens the namespace picker regardless of which
-	// pane is focused. We only trigger it from the main page so it can't
-	// re-open while the picker itself is up.
-	a.app.SetInputCapture(func(ev *tcell.EventKey) *tcell.EventKey {
-		if ev.Rune() == 'n' || ev.Rune() == 'N' {
+	a.podsTable = newPodsTable(a)
+	a.deploymentsTable = newDeploymentsTable(a)
+
+	a.mainGrid.
+		SetRows(5, 0, 1).
+		SetColumns(0).
+		SetBorders(false)
+
+	a.mainGrid.AddItem(headerFlex, 0, 0, 1, 1, 0, 0, false)
+	a.mainGrid.AddItem(a.podsTable, 1, 0, 1, 1, 0, 0, true)
+	a.mainGrid.AddItem(footerFlex, 2, 0, 1, 1, 0, 0, false)
+
+	a.pages.SetInputCapture(func(ev *tcell.EventKey) *tcell.EventKey {
+		switch ev.Rune() {
+		case 'p', 'P':
+			a.switchToPods()
+			return nil
+		case 'd', 'D':
+			a.switchToDeployments()
+			return nil
+		case 'n', 'N':
 			if name, _ := a.pages.GetFrontPage(); name == "main" {
 				a.showNamespacePicker()
-				return nil
 			}
+			return nil
+		case 'r', 'R':
+			a.refreshActiveOnly()
+			return nil
 		}
 		return ev
 	})
 
-	return a.app.SetRoot(a.pages, true).EnableMouse(true).Run()
+	a.pages.AddPage("main", a.mainGrid, true, true)
+
+	a.app.SetRoot(a.pages, true)
+	a.app.SetFocus(a.podsTable)
+
+	return a.app.Run()
+}
+
+func (a *App) switchToPods() {
+	if a.activeScreen == ScreenPods {
+		return
+	}
+	a.activeScreen = ScreenPods
+	a.updateHeader()
+
+	a.mainGrid.RemoveItem(a.deploymentsTable)
+	a.mainGrid.AddItem(a.podsTable, 1, 0, 1, 1, 0, 0, true)
+
+	a.app.SetFocus(a.podsTable)
+	a.refreshActiveOnly()
+}
+
+func (a *App) switchToDeployments() {
+	if a.activeScreen == ScreenDeployments {
+		return
+	}
+	a.activeScreen = ScreenDeployments
+	a.updateHeader()
+
+	a.mainGrid.RemoveItem(a.podsTable)
+	a.mainGrid.AddItem(a.deploymentsTable, 1, 0, 1, 1, 0, 0, true)
+
+	a.app.SetFocus(a.deploymentsTable)
+	a.refreshActiveOnly()
 }
 
 func (a *App) showNamespacePicker() {

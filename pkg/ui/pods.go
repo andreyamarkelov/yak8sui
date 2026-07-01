@@ -17,9 +17,8 @@ func newPodsTable(a *App) *tview.Table {
 	table.SetBorder(true).
 		SetTitleAlign(tview.AlignCenter)
 
-	table.SetCell(0, 0, tview.NewTableCell("#").SetTextColor(tcell.ColorYellow).SetSelectable(false))
-	table.SetCell(0, 1, tview.NewTableCell("Pod Name").SetTextColor(tcell.ColorYellow).SetSelectable(false))
-	table.SetCell(0, 2, tview.NewTableCell("Status").SetTextColor(tcell.ColorYellow).SetSelectable(false))
+	table.SetCell(0, 0, tview.NewTableCell("Pod Name").SetTextColor(tcell.ColorYellow).SetSelectable(false))
+	table.SetCell(0, 1, tview.NewTableCell("Status").SetTextColor(tcell.ColorYellow).SetSelectable(false))
 
 	refreshData := func() {
 		table.SetTitle(fmt.Sprintf(" Pods in namespace: [%s] ", a.Namespace()))
@@ -42,13 +41,12 @@ func newPodsTable(a *App) *tview.Table {
 		for i, pod := range pods {
 			row := i + 1
 
-			table.SetCell(row, 0, tview.NewTableCell(fmt.Sprintf("%d", row)).SetTextColor(tcell.ColorGray))
-			table.SetCell(row, 1, tview.NewTableCell(pod.Name).SetTextColor(tcell.ColorLightCyan))
-			table.SetCell(row, 2, tview.NewTableCell(pod.Status).SetTextColor(statusColor(pod.Status)))
+			table.SetCell(row, 0, tview.NewTableCell(pod.Name).SetTextColor(tcell.ColorLightCyan))
+			table.SetCell(row, 1, tview.NewTableCell(pod.Status).SetTextColor(statusColor(pod.Status)))
 		}
 	}
 
-	a.register(refreshData)
+	a.register(ScreenPods, refreshData)
 	refreshData()
 
 	table.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {

@@ -5,8 +5,9 @@
 > and the architecture that ties it together — and explains the *why* behind
 > each decision, not just the *what*.
 
-The project is a small terminal app (TUI) that lists Kubernetes pods and lets
-you switch namespaces on the fly, similar to the popular tool `k9s`.
+The project is a small terminal app (TUI) that lists Kubernetes **pods and
+deployments**, lets you **switch between those views** with a keypress, and lets
+you **switch namespaces** on the fly — similar to the popular tool `k9s`.
 
 ---
 
@@ -74,19 +75,22 @@ yak8sui/
 │   ├── k8s/                # DATA layer (package k8s) — knows client-go
 │   │   ├── client.go       #   newClientset(): kubeconfig → clientset
 │   │   ├── pods.go         #   PodInfo struct + ListPods(namespace)
+│   │   ├── deployments.go  #   DeploymentInfo struct + ListDeployments(namespace)
 │   │   └── namespaces.go   #   ListNamespaces()
 │   └── ui/                 # UI layer (package ui) — knows tview
-│       ├── app.go          #   App struct, New(), Run(), SetNamespace(),
-│       │                   #   the global keybinding, showNamespacePicker(), modal()
+│       ├── app.go          #   App struct, New(), Run(), SetNamespace(), screen
+│       │                   #   switching, the global keybindings, picker, modal()
 │       ├── pods.go         #   newPodsTable(): the pods table + refreshData()
+│       ├── deployments.go  #   newDeploymentsTable(): the deployments table
 │       └── colors.go       #   statusColor(): maps a pod status to a color
 ├── go.mod                  # module name + dependency versions
 └── go.sum                  # cryptographic checksums of those dependencies
 ```
 
 A quick way to read it: **one folder per package**, **one file per responsibility**.
-To add a "deployments" feature later you'd create `pkg/k8s/deployments.go` (data)
-and `pkg/ui/deployments.go` (view) — no existing files need to change.
+This is exactly how the deployments view was added — a `pkg/k8s/deployments.go`
+(data) and a `pkg/ui/deployments.go` (view), with **no changes** needed to the
+existing pods files.
 
 ---
 
@@ -290,72 +294,118 @@ namespaces and have every pane update**, copies become a trap:
 
 ### 4.2 The solution: centralized state + observers
 
-We introduce an `App` struct that **owns** the shared state and a list of
-"refresh me" callbacks. This is the classic **observer pattern** (the same idea
-behind Redux/MVU on the frontend).
+We introduce an `App` struct that **owns** the shared state (the current
+namespace *and* which screen is active) and a list of "refresh me" callbacks.
+This is the classic **observer pattern** (the same idea behind Redux/MVU on the
+frontend).
+
+First, two small helper types. Since the app now has more than one screen, we
+label each screen with a `ScreenType` and tag every refresher with the screen it
+belongs to:
 
 ```go
-// App is the single source of truth for shared UI state (like the current
-// namespace). Views read that state through it and subscribe to changes so
-// every pane stays in sync.
-type App struct {
-    app         *tview.Application
-    pages       *tview.Pages
-    headerRight *tview.TextView
-    namespace   string      // ← the one and only copy
-    refreshers  []func()    // ← every view's "redraw yourself" function
+type ScreenType int
+
+const (
+    ScreenPods ScreenType = iota
+    ScreenDeployments
+)
+
+// Each registered refresher remembers which screen it belongs to.
+type RefreshRequest struct {
+    Screen    ScreenType
+    Refresher func()
 }
 ```
 
-Three small methods make the whole pattern work:
+Now the `App` struct itself:
+
+```go
+// App is the single source of truth for shared UI state (the current namespace
+// and which screen is active). Views read that state through it and subscribe to
+// changes so the visible pane stays in sync.
+type App struct {
+    app         *tview.Application
+    pages       *tview.Pages
+    mainGrid    *tview.Grid
+    headerLeft  *tview.TextView
+    headerRight *tview.TextView
+
+    podsTable        *tview.Table
+    deploymentsTable *tview.Table
+
+    namespace    string           // ← the one and only copy
+    activeScreen ScreenType       // ← Pods or Deployments
+    refreshers   []RefreshRequest // ← each view's redraw fn, tagged by screen
+}
+```
+
+The methods that make the pattern work:
 
 ```go
 // Views READ the namespace through this — never their own copy.
 func (a *App) Namespace() string { return a.namespace }
 
-// A view SUBSCRIBES by handing over its redraw function.
-func (a *App) register(refresh func()) {
-    a.refreshers = append(a.refreshers, refresh)
+// A view SUBSCRIBES by handing over its redraw function, tagged with its screen.
+func (a *App) register(screen ScreenType, refresh func()) {
+    a.refreshers = append(a.refreshers, RefreshRequest{Screen: screen, Refresher: refresh})
 }
 
-// The ONE place the namespace changes. It updates state, then notifies everyone.
+// Changing the namespace refreshes only the screen that's currently visible.
 func (a *App) SetNamespace(ns string) {
     a.namespace = ns
     a.updateHeader()
-    for _, refresh := range a.refreshers {
-        refresh()
+    a.refreshActiveOnly()
+}
+
+// refreshActiveOnly runs the redraw functions for the active screen only.
+func (a *App) refreshActiveOnly() {
+    for _, req := range a.refreshers {
+        if req.Screen == a.activeScreen {
+            req.Refresher()
+        }
     }
 }
 ```
 
-Picture it as a hub-and-spoke. At startup every view **subscribes**; later one
-`SetNamespace` call **broadcasts** to all of them:
+> **Why refresh only the active screen?** Only one table is visible at a time
+> (pods *or* deployments). Redrawing the hidden one would waste work *and* fire an
+> extra network call to Kubernetes for data nobody is looking at. So each
+> refresher is tagged with its screen, and `refreshActiveOnly` skips the rest. When
+> you switch screens, that switch calls `refreshActiveOnly` too, so the
+> newly-shown table loads fresh data on demand.
+
+Picture it as a hub-and-spoke. At startup every view **subscribes** (tagged by
+screen); later one `SetNamespace` call **broadcasts — but only to the active
+screen's refreshers**:
 
 ```
-   REGISTRATION  (each view calls a.register(refreshData) at startup)
+   REGISTRATION  (each view calls a.register(SCREEN, refreshData) at startup)
 
-   ┌────────────┐  ┌──────────────┐  ┌────────────┐
-   │ pods table │  │ deployments  │  │  services  │
-   │refreshData │  │ refreshData  │  │ refreshData│
-   └─────┬──────┘  └──────┬───────┘  └─────┬──────┘
-         │                │                │
-         └────────────────┼────────────────┘
-                          ▼
-              ┌──────────────────────┐
-              │         App          │
-              │  namespace           │
-              │  refreshers []func() │
-              └──────────┬───────────┘
+   ┌────────────────┐        ┌─────────────────────┐
+   │ pods table     │        │ deployments table   │
+   │ {Pods, refresh}│        │ {Deployments,refresh}│
+   └───────┬────────┘        └──────────┬──────────┘
+           │                            │
+           └─────────────┬──────────────┘
+                         ▼
+             ┌────────────────────────┐
+             │          App           │
+             │  namespace             │
+             │  activeScreen = Pods   │
+             │  refreshers            │
+             │    []RefreshRequest    │
+             └───────────┬────────────┘
 
-   BROADCAST  (one SetNamespace reaches every view at once)
+   BROADCAST  (SetNamespace runs only refreshers whose Screen == activeScreen)
 
-                          │  SetNamespace("kube-system")
-                          │  → range a.refreshers
-                          ▼
-           ╔═══════════════════════════════════╗
-           ║ every refresh() fires at once —  ║
-           ║ all views redraw themselves      ║
-           ╚═══════════════════════════════════╝
+                         │  SetNamespace("kube-system")
+                         │  → refreshActiveOnly()
+                         ▼
+          ╔═════════════════════════════════════════╗
+          ║ only the ACTIVE screen's refresh() runs ║
+          ║ (the hidden table is skipped)           ║
+          ╚═════════════════════════════════════════╝
 ```
 
 ### 4.3 How a view plugs in
@@ -371,54 +421,95 @@ func newPodsTable(a *App) *tview.Table {
         // ...fill rows...
     }
 
-    a.register(refreshData) // subscribe to namespace changes
-    refreshData()           // draw once immediately
+    a.register(ScreenPods, refreshData) // subscribe (tagged as the Pods screen)
+    refreshData()                       // draw once immediately
     // ...
 }
 ```
 
-### 4.4 Why a global keybinding
+### 4.4 Global keybindings
 
-The "switch namespace" key must work no matter which pane is focused. So it is
-captured on the **application** itself, not on any single widget:
+The keys must work no matter which pane is focused, so they're captured once — on
+the `Pages` container that holds everything, not on any single widget:
 
 ```go
-a.app.SetInputCapture(func(ev *tcell.EventKey) *tcell.EventKey {
-    if ev.Rune() == 'n' || ev.Rune() == 'N' {
+a.pages.SetInputCapture(func(ev *tcell.EventKey) *tcell.EventKey {
+    switch ev.Rune() {
+    case 'p', 'P':
+        a.switchToPods()
+        return nil
+    case 'd', 'D':
+        a.switchToDeployments()
+        return nil
+    case 'n', 'N':
         if name, _ := a.pages.GetFrontPage(); name == "main" {
             a.showNamespacePicker()
-            return nil
         }
+        return nil
+    case 'r', 'R':
+        a.refreshActiveOnly()
+        return nil
     }
     return ev
 })
 ```
 
-The `GetFrontPage() == "main"` check stops the picker from re-opening while it's
-already on screen.
+- `p` / `d` — switch between the Pods and Deployments views.
+- `n` — open the namespace picker (only when the `"main"` page is in front, so it
+  can't re-open on top of itself).
+- `r` — manually refresh the active screen.
 
-### 4.5 The popup, via `Pages`
+### 4.5 Switching screens
+
+Because both tables are built once and stored on the `App` (`podsTable`,
+`deploymentsTable`), switching a view is just swapping which table sits in the
+middle row of the grid:
+
+```go
+func (a *App) switchToDeployments() {
+    if a.activeScreen == ScreenDeployments {
+        return // already here, nothing to do
+    }
+    a.activeScreen = ScreenDeployments
+    a.updateHeader()
+
+    a.mainGrid.RemoveItem(a.podsTable)
+    a.mainGrid.AddItem(a.deploymentsTable, 1, 0, 1, 1, 0, 0, true)
+
+    a.app.SetFocus(a.deploymentsTable)
+    a.refreshActiveOnly() // load fresh data for the newly-shown screen
+}
+```
+
+`switchToPods` is the mirror image. Each starts with an "am I already here?"
+guard so pressing the same key twice does nothing.
+
+### 4.6 The popup, via `Pages`
 
 `tview.Pages` lets us stack screens. The namespace picker is a `tview.List`
 fetched from the cluster, centered with a small `modal()` helper that uses empty
 flex items as spacers. Selecting an item calls `a.SetNamespace(...)` and removes
 the page.
 
-### 4.6 Why this scales
+### 4.7 Why this scales
 
 | Concern | How it's handled |
 |---|---|
 | All panes use the same namespace | They call `a.Namespace()`, never a copy |
-| Switching updates everything | `SetNamespace` loops over `refreshers` |
-| Works from any focused pane | Key is captured on `app`, not a widget |
-| Adding a deployments view later | It just calls `a.register(refresh)` — free updates |
+| Switching namespace redraws the view | `SetNamespace` → `refreshActiveOnly()` |
+| Only the visible screen does work | Refreshers are tagged by `ScreenType` |
+| Switching between views | `p` / `d` swap which table sits in the grid |
+| Works from any focused pane | Keys are captured on `pages`, not a widget |
+| Adding another view later | Build a table + `a.register(screen, refresh)` |
 
-Adding a new view that follows the global namespace is now trivial:
+Adding the deployments view *did* follow this recipe — that's not hypothetical
+anymore:
 
 ```go
 func newDeploymentsTable(a *App) *tview.Table {
-    refreshData := func() { /* k8s.ListDeployments(a.Namespace()) */ }
-    a.register(refreshData) // 'n' now refreshes this view too, automatically
+    refreshData := func() { /* k8s.ListDeployments(a.Namespace()) ... */ }
+    a.register(ScreenDeployments, refreshData) // tagged as the Deployments screen
+    refreshData()
     // ...
 }
 ```
@@ -546,11 +637,16 @@ After startup, exactly one big box lives in memory — the `app` variable of typ
 
 ```
 [ app (*ui.App) in memory ]
-├── namespace   = "kube-system"
-├── app         = [the running tview.Application]
-├── pages       = [page manager, currently holding the Grid]
-├── headerRight = [the text view we write status into]
-└── refreshers  = [list holding the pods table's refreshData()]
+├── namespace        = "kube-system"
+├── activeScreen     = ScreenPods
+├── app              = [the running tview.Application]
+├── pages            = [page manager, currently holding the main Grid]
+├── mainGrid         = [header / active table / footer]
+├── headerLeft       = [the ASCII-art title]
+├── headerRight      = [status: active screen + namespace]
+├── podsTable        = [the pods table widget]
+├── deploymentsTable = [the deployments table widget]
+└── refreshers       = [{Pods, refreshData}, {Deployments, refreshData}]
 ```
 
 When `main.go` reaches `app.Run()`, control passes *into* `tview` and **stops
@@ -574,37 +670,40 @@ variable, put it in a slice, or pass it as an argument. That's what powers the
 observer registry.
 
 Think of `App` as a **magazine publisher** with a blank subscriber list
-(`refreshers []func()`). The pods table is a **reader**. When it calls
-`a.register(refreshData)`, it isn't asking for data now — it's handing over its
-"business card" (the function) to be called later:
+(`refreshers []RefreshRequest`). The pods table is a **reader**. When it calls
+`a.register(ScreenPods, refreshData)`, it isn't asking for data now — it's handing
+over its "business card" (the function, plus which screen it's for) to be called
+later:
 
 ```go
-type App struct {
-    // ...
-    refreshers []func() // a slice that holds FUNCTIONS
+type RefreshRequest struct {
+    Screen    ScreenType
+    Refresher func() // ← a FUNCTION stored as a value
 }
 
-func (a *App) register(refresh func()) {
-    a.refreshers = append(a.refreshers, refresh) // file it away
+func (a *App) register(screen ScreenType, refresh func()) {
+    a.refreshers = append(a.refreshers, RefreshRequest{Screen: screen, Refresher: refresh})
 }
 ```
 
 The type `func()` means "a function taking no arguments and returning nothing."
-Crucially, we pass `refreshData` **without** parentheses — `register(refreshData)`
-hands over the function itself; `register(refreshData())` would *call* it and pass
-the result instead. Later, `SetNamespace` invokes each one **with** parentheses:
+Crucially, we pass `refreshData` **without** parentheses — `register(..., refreshData)`
+hands over the function itself; `refreshData()` would *call* it and pass the result
+instead. Later, `refreshActiveOnly` invokes the matching ones **with** parentheses:
 
 ```go
-for _, refresh := range a.refreshers {
-    refresh() // the () means "run it now"
+for _, req := range a.refreshers {
+    if req.Screen == a.activeScreen {
+        req.Refresher() // the () means "run it now"
+    }
 }
 ```
 
 The magic is that `refreshData` is a **closure**: it "captured" the `table`
 variable from `newPodsTable`. Even after we hand it to `App`, it still remembers
 which table to clear and fill. And `App` has no idea `pods.go` even exists — it
-just calls abstract functions. Register ten tables (pods, services, deployments)
-and all of them refresh with that one loop.
+just calls abstract functions. Register more tables (deployments, services…) and
+the same loop refreshes whichever screen is active.
 
 ```
    newPodsTable(a *App)                          App
@@ -618,7 +717,7 @@ and all of them refresh with that one loop.
    │ }                            │             │                  │
    │                              │             │                  │
    └──────────┬───────────────────┘             │                  │
-              │  a.register(refreshData)        │                  │
+              │  a.register(ScreenPods, refreshData)             │
               └─────────────────────────────────▶  filed here     │
                                                └──────────────────┘
 
@@ -674,7 +773,7 @@ Here is the full chain of events when the user presses `n` and picks a namespace
 User presses 'n'
    │
    ▼
-app.SetInputCapture fires  →  a.showNamespacePicker()
+pages.SetInputCapture fires  →  a.showNamespacePicker()
    │
    ▼
 k8s.ListNamespaces()  →  popup tview.List of namespaces
@@ -683,14 +782,16 @@ k8s.ListNamespaces()  →  popup tview.List of namespaces
 User selects "kube-system"  →  a.SetNamespace("kube-system")
    │
    ├─ a.namespace = "kube-system"      (update the single source of truth)
-   ├─ a.updateHeader()                 (header now shows the new namespace)
-   └─ for each refresher: refresh()    (every view redraws itself)
+   ├─ a.updateHeader()                 (header shows active screen + namespace)
+   └─ a.refreshActiveOnly()            (only the VISIBLE screen redraws)
           │
           ▼
-      pods table calls k8s.ListPods("kube-system")  →  new rows appear
+      active table calls k8s.List…(a.Namespace())  →  new rows appear
 ```
 
-One state change, every subscribed view stays in sync. That's the payoff.
+One state change, and the visible screen stays in sync. Switching screens with
+`p` / `d` works the same way: it flips `activeScreen`, swaps the table in the grid,
+and calls `refreshActiveOnly()` so the newly-shown table loads on demand.
 
 ---
 
@@ -703,10 +804,11 @@ doesn't report a terminal type.
 enable "Emulate terminal in output console".
 
 ### Disappearing `[r]` text in the footer
-With `SetDynamicColors(true)`, the text `[r]` is parsed as a *color tag* (and
-vanishes). Two options: disable dynamic colors for that view, or escape the
-brackets by doubling them — `[[r]]` renders as a literal `[r]`. (That's exactly
-why the footer in `app.go` writes `[[yellow]n[-]]`.)
+With `SetDynamicColors(true)`, text like `[r]` is parsed as a *color tag* (and
+vanishes). The fix is to escape a literal bracket by doubling it — `[[` renders as
+a single `[`. That's why the footer in `app.go` writes strings like
+`[[[yellow]n[white]]]amespace`: the leading `[[` prints a real `[`, then
+`[yellow]`/`[white]` switch colors to highlight the shortcut key.
 
 ### Capturing the loop variable in a closure
 When you create a closure inside a `for` loop and the closure uses the loop
