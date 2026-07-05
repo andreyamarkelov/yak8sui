@@ -66,7 +66,7 @@ func New(cfg Config) *App {
 		pages:        tview.NewPages(),
 		mainGrid:     tview.NewGrid(),
 		namespace:    cfg.Namespace,
-		activeScreen: ScreenPods, // По умолчанию показываем поды
+		activeScreen: ScreenPods, // default view on startup
 	}
 }
 
@@ -99,7 +99,7 @@ func (a *App) updateHeader() {
 	 \ V // _ \ | ' // _ \___ \| | | || | 
 	  | |/ ___ \| . \ (_) |__) | |_| || | 
 	  |_/_/   \_\_|\_\___/____/ \___/|___|
-	    Yust another k8s User Interface`
+	    Yet Another k8s User Interface`
 	a.headerLeft.SetText(headerArt).SetTextColor(tcell.ColorLightCyan)
 	status := fmt.Sprintf("View: [green]%s[white] | Namespace: [yellow]%s[white]", a.ActiveScreen(), a.Namespace())
 	a.headerRight.SetText(status)

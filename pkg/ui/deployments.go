@@ -39,12 +39,10 @@ func newDeploymentsTable(a *App) *tview.Table {
 			return
 		}
 
-		// Заполнение строк
 		for i, d := range deploys {
 			row := i + 1
 			table.SetCell(row, 0, tview.NewTableCell(d.Name).SetTextColor(tcell.ColorWhite))
 
-			// Форматируем колонку READY (например, "3/3")
 			readyText := fmt.Sprintf("%d/%d", d.Available, d.Replicas)
 			color := tcell.ColorGreen
 			if d.Available < d.Replicas {
@@ -55,9 +53,22 @@ func newDeploymentsTable(a *App) *tview.Table {
 		}
 	}
 
-	// Resister function with ScreenDeployments
+	// Register refresher with ScreenDeployments
 	a.register(ScreenDeployments, refreshData)
 	refreshData()
+
+	table.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		switch event.Key() {
+		case tcell.KeyEscape, tcell.KeyCtrlC:
+			a.app.Stop()
+		}
+
+		if event.Rune() == 'r' || event.Rune() == 'R' {
+			refreshData()
+		}
+
+		return event
+	})
 
 	return table
 }
