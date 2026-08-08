@@ -16,9 +16,8 @@ safe-outputs:
 
 tools:
   github:
---- 
-engine: copilot
-model: gpt-5-mini
+---
+engine: copilot-gpt-5-mini
 ---
 
 Daily Repository Status Report
