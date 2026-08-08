@@ -17,6 +17,8 @@ safe-outputs:
 tools:
   github:
 --- 
+engine: copilot
+model: gpt-5-mini
 
 Daily Repository Status Report
 Create a daily report for maintainers.
